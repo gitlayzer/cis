@@ -4,9 +4,16 @@ import (
 	"github.com/gin-gonic/gin"
 	"cis/pkg/handler"
 	"cis/pkg/service"
+	"cis/pkg/db"
+	"fmt"
 )
 
 func main() {
+	// 初始化数据库
+	if err := db.InitDB(); err != nil {
+		panic(fmt.Sprintf("初始化数据库失败: %v", err))
+	}
+
 	r := gin.Default()
 	
 	// 初始化服务和处理器
