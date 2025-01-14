@@ -15,6 +15,7 @@ const (
 // WorkflowSpec 定义同步工作流配置
 type WorkflowSpec struct {
 	Name       string        `json:"name"`
+	UserID     uint         `json:"user_id,omitempty"`
 	Source     RegistryAuth  `json:"source"`
 	Targets    []RegistryAuth `json:"targets"`
 	Images     []string      `json:"images"`
@@ -43,9 +44,9 @@ type WorkflowLog struct {
 
 // RegistryAuth 定义镜像仓库认证信息
 type RegistryAuth struct {
-	URL      string `json:"url"`
-	Auth     Auth   `json:"auth"`
-	Insecure bool   `json:"insecure"`
+	URL       string `json:"url"`
+	Auth      *Auth  `json:"auth,omitempty"`
+	Insecure  bool   `json:"insecure"`
 	Namespace string `json:"namespace,omitempty"`
 }
 

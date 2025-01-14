@@ -64,17 +64,25 @@ func (s *ImageSyncer) SyncImage(ctx context.Context, imageRef string) error {
 
 	fmt.Printf("源镜像引用: %s\n", sourceRef.String())
 
-	// 2. 配置源仓库认证
-	sourceAuth := authn.AuthConfig{
-		Username: s.source.Auth.Username,
-		Password: s.source.Auth.Password,
+	// 2. 配置源仓库认证（如果有）
+	var sourceAuth authn.Authenticator
+	if s.source.Auth != nil {
+		sourceAuth = authn.FromConfig(authn.AuthConfig{
+			Username: s.source.Auth.Username,
+			Password: s.source.Auth.Password,
+		})
+	} else {
+		sourceAuth = authn.Anonymous
 	}
 
-	// 3. 获取源镜像
-	sourceImage, err := remote.Image(sourceRef, 
-		remote.WithAuth(authn.FromConfig(sourceAuth)),
+	// 配置源仓库传输层
+	sourceTransport := http.DefaultTransport.(*http.Transport).Clone()
+
+	// 获取源镜像
+	sourceImage, err := remote.Image(sourceRef,
+		remote.WithAuth(sourceAuth),
 		remote.WithContext(ctx),
-		remote.WithTransport(http.DefaultTransport))
+		remote.WithTransport(sourceTransport))
 	if err != nil {
 		return fmt.Errorf("获取源镜像失败: %w", err)
 	}
@@ -96,16 +104,24 @@ func (s *ImageSyncer) SyncImage(ctx context.Context, imageRef string) error {
 		fmt.Printf("目标镜像引用: %s\n", targetRef.String())
 
 		// 配置目标仓库认证
-		targetAuth := authn.AuthConfig{
-			Username: target.Auth.Username,
-			Password: target.Auth.Password,
+		var targetAuth authn.Authenticator
+		if target.Auth != nil {
+			targetAuth = authn.FromConfig(authn.AuthConfig{
+				Username: target.Auth.Username,
+				Password: target.Auth.Password,
+			})
+		} else {
+			targetAuth = authn.Anonymous
 		}
 
+		// 配置目标仓库传输层
+		targetTransport := http.DefaultTransport.(*http.Transport).Clone()
+
 		// 推送镜像到目标仓库
-		if err := remote.Write(targetRef, sourceImage, 
-			remote.WithAuth(authn.FromConfig(targetAuth)),
+		if err := remote.Write(targetRef, sourceImage,
+			remote.WithAuth(targetAuth),
 			remote.WithContext(ctx),
-			remote.WithTransport(http.DefaultTransport)); err != nil {
+			remote.WithTransport(targetTransport)); err != nil {
 			return fmt.Errorf("推送镜像到目标仓库失败: %w", err)
 		}
 

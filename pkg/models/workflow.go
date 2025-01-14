@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"gorm.io/gorm"
 	"cis/pkg/types"
+	"fmt"
 )
 
 // Workflow 数据库模型
 type Workflow struct {
 	gorm.Model
-	Name       string `gorm:"type:varchar(255);uniqueIndex"`
+	Name       string `gorm:"type:varchar(255);uniqueIndex:idx_name_user"`
+	UserID     uint   `gorm:"uniqueIndex:idx_name_user"`
+	User       User   `gorm:"foreignKey:UserID"`
 	Source     string `gorm:"type:text"` // JSON 存储
 	Targets    string `gorm:"type:text"` // JSON 存储
 	Images     string `gorm:"type:text"` // JSON 存储
@@ -23,9 +26,11 @@ type Workflow struct {
 func (w *Workflow) ToSpec() (*types.WorkflowSpec, error) {
 	spec := &types.WorkflowSpec{
 		Name:       w.Name,
+		UserID:     w.UserID,
 		Status:     types.WorkflowStatus(w.Status),
 		CreateTime: w.CreatedAt,
 		UpdateTime: w.UpdatedAt,
+		Logs:       make([]types.WorkflowLog, 0), // 初始化空日志数组
 	}
 
 	// 解析 Source
@@ -53,8 +58,13 @@ func (w *Workflow) ToSpec() (*types.WorkflowSpec, error) {
 	}
 
 	// 解析 Logs
-	if err := json.Unmarshal([]byte(w.Logs), &spec.Logs); err != nil {
-		return nil, err
+	if w.Logs != "" {
+		var logs []types.WorkflowLog
+		if err := json.Unmarshal([]byte(w.Logs), &logs); err != nil {
+			fmt.Printf("解析日志失败: %v\n", err)
+		} else {
+			spec.Logs = logs
+		}
 	}
 
 	// 解析 Schedule
@@ -73,6 +83,7 @@ func (w *Workflow) ToSpec() (*types.WorkflowSpec, error) {
 func (w *Workflow) FromSpec(spec *types.WorkflowSpec) error {
 	w.Name = spec.Name
 	w.Status = string(spec.Status)
+	w.UserID = spec.UserID
 
 	// 序列化 Source
 	source, err := json.Marshal(spec.Source)

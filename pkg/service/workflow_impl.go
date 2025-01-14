@@ -6,12 +6,14 @@ import (
 	"sync"
 	"time"
 	"encoding/json"
+	"strings"
 
 	"cis/pkg/types"
 	"cis/pkg/registry"
 	"github.com/robfig/cron"
 	"cis/pkg/db"
 	"cis/pkg/models"
+	"gorm.io/gorm"
 )
 
 type workflowServiceImpl struct {
@@ -30,6 +32,9 @@ func NewWorkflowService() WorkflowService {
 
 	// 启动调度器
 	go svc.runScheduler()
+
+	// 恢复异常终止的工作流状态
+	go svc.recoverWorkflowStates()
 
 	return svc
 }
@@ -91,13 +96,18 @@ func (w *workflowServiceImpl) checkScheduledWorkflows() {
 }
 
 func (w *workflowServiceImpl) CreateWorkflow(ctx context.Context, spec *types.WorkflowSpec) error {
+	userID, ok := ctx.Value("user_id").(uint)
+	if !ok {
+		return fmt.Errorf("未授权的访问")
+	}
+	
 	// 检查是否存在
 	var count int64
-	if err := db.DB.Model(&models.Workflow{}).Where("name = ?", spec.Name).Count(&count).Error; err != nil {
-		return err
+	if err := db.DB.Model(&models.Workflow{}).Where("name = ? AND user_id = ?", spec.Name, userID).Count(&count).Error; err != nil {
+		return fmt.Errorf("检查工作流是否存在时发生错误: %v", err)
 	}
 	if count > 0 {
-		return fmt.Errorf("工作流 %s 已存在", spec.Name)
+		return fmt.Errorf("工作流 '%s' 已存在，请使用其他名称", spec.Name)
 	}
 
 	// 设置初始状态和时间
@@ -118,9 +128,13 @@ func (w *workflowServiceImpl) CreateWorkflow(ctx context.Context, spec *types.Wo
 
 	// 创建数据库记录
 	workflow := &models.Workflow{}
-	// 先设置基本字段
 	workflow.Name = spec.Name
+	workflow.UserID = userID
 	workflow.Status = string(spec.Status)
+
+	// 初始化空日志数组
+	emptyLogs, _ := json.Marshal(make([]types.WorkflowLog, 0))
+	workflow.Logs = string(emptyLogs)
 
 	// 序列化各个字段
 	if source, err := json.Marshal(spec.Source); err == nil {
@@ -132,9 +146,6 @@ func (w *workflowServiceImpl) CreateWorkflow(ctx context.Context, spec *types.Wo
 	if images, err := json.Marshal(spec.Images); err == nil {
 		workflow.Images = string(images)
 	}
-	if logs, err := json.Marshal(spec.Logs); err == nil {
-		workflow.Logs = string(logs)
-	}
 	if spec.Schedule != nil {
 		if schedule, err := json.Marshal(spec.Schedule); err == nil {
 			workflow.Schedule = string(schedule)
@@ -142,8 +153,14 @@ func (w *workflowServiceImpl) CreateWorkflow(ctx context.Context, spec *types.Wo
 	}
 
 	if err := db.DB.Create(workflow).Error; err != nil {
+		if strings.Contains(err.Error(), "Duplicate entry") {
+			return fmt.Errorf("工作流 '%s' 已存在，请使用其他名称", spec.Name)
+		}
 		return fmt.Errorf("创建工作流记录失败: %v", err)
 	}
+
+	// 设置 spec 的 UserID，这样 addWorkflowLog 可以正确工作
+	spec.UserID = userID
 
 	// 添加创建日志
 	w.addWorkflowLog(spec, "info", "工作流创建成功")
@@ -151,8 +168,12 @@ func (w *workflowServiceImpl) CreateWorkflow(ctx context.Context, spec *types.Wo
 }
 
 func (w *workflowServiceImpl) ListWorkflows(ctx context.Context) ([]*types.WorkflowSpec, error) {
+	userID, ok := ctx.Value("user_id").(uint)
+	if !ok {
+		return nil, fmt.Errorf("未授权的访问")
+	}
 	var workflows []models.Workflow
-	if err := db.DB.Find(&workflows).Error; err != nil {
+	if err := db.DB.Where("user_id = ?", userID).Find(&workflows).Error; err != nil {
 		return nil, err
 	}
 
@@ -168,8 +189,13 @@ func (w *workflowServiceImpl) ListWorkflows(ctx context.Context) ([]*types.Workf
 }
 
 func (w *workflowServiceImpl) GetWorkflow(ctx context.Context, name string) (*types.WorkflowSpec, error) {
+	userID, ok := ctx.Value("user_id").(uint)
+	if !ok {
+		return nil, fmt.Errorf("未授权的访问")
+	}
+
 	var workflow models.Workflow
-	if err := db.DB.Where("name = ?", name).First(&workflow).Error; err != nil {
+	if err := db.DB.Where("name = ? AND user_id = ?", name, userID).First(&workflow).Error; err != nil {
 		return nil, fmt.Errorf("工作流 %s 不存在", name)
 	}
 
@@ -177,10 +203,27 @@ func (w *workflowServiceImpl) GetWorkflow(ctx context.Context, name string) (*ty
 }
 
 func (w *workflowServiceImpl) UpdateWorkflow(ctx context.Context, spec *types.WorkflowSpec) error {
+	userID := ctx.Value("user_id").(uint)
+	// 确保设置了 UserID
+	spec.UserID = userID
+
+	// 先获取现有的工作流
 	var workflow models.Workflow
-	if err := db.DB.Where("name = ?", spec.Name).First(&workflow).Error; err != nil {
+	if err := db.DB.Where("name = ? AND user_id = ?", spec.Name, userID).First(&workflow).Error; err != nil {
 		return fmt.Errorf("工作流 %s 不存在", spec.Name)
 	}
+
+	// 获取现有的工作流规范，保留状态和运行记录
+	existingSpec, err := workflow.ToSpec()
+	if err != nil {
+		return fmt.Errorf("解析工作流数据失败: %v", err)
+	}
+
+	// 保留原有的状态相关字段
+	spec.Status = existingSpec.Status
+	spec.LastRun = existingSpec.LastRun
+	spec.Logs = existingSpec.Logs
+	spec.CreateTime = existingSpec.CreateTime
 
 	// 更新时间
 	spec.UpdateTime = time.Now()
@@ -200,24 +243,54 @@ func (w *workflowServiceImpl) UpdateWorkflow(ctx context.Context, spec *types.Wo
 }
 
 func (w *workflowServiceImpl) DeleteWorkflow(ctx context.Context, name string) error {
-	if err := db.DB.Where("name = ?", name).Delete(&models.Workflow{}).Error; err != nil {
+	userID := ctx.Value("user_id").(uint)
+	if err := db.DB.Where("name = ? AND user_id = ?", name, userID).Delete(&models.Workflow{}).Error; err != nil {
 		return err
 	}
 	return nil
 }
 
 func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) error {
+	userID := ctx.Value("user_id").(uint)
 	workflow, err := w.GetWorkflow(ctx, name)
 	if err != nil {
 		return err
 	}
 
 	w.Lock()
+	defer w.Unlock()
+
+	// 检查工作流状态，如果是 running 状态但没有对应的任务，说明是异常终止
+	if workflow.Status == types.WorkflowStatusRunning {
+		if _, exists := w.tasks[name]; !exists {
+			// 重置状态
+			workflow.Status = types.WorkflowStatusFailed
+			run := &types.WorkflowRun{
+				StartTime: workflow.LastRun.StartTime,
+				EndTime:   time.Now(),
+				Status:    types.WorkflowStatusFailed,
+				Message:   "工作流异常终止",
+			}
+			workflow.LastRun = run
+
+			// 更新数据库
+			var dbWorkflow models.Workflow
+			if err := db.DB.Where("name = ? AND user_id = ?", name, userID).First(&dbWorkflow).Error; err == nil {
+				lastRun, _ := json.Marshal(run)
+				dbWorkflow.Status = string(workflow.Status)
+				dbWorkflow.LastRun = string(lastRun)
+				db.DB.Save(&dbWorkflow)
+			}
+		}
+	}
+
 	// 检查工作流是否正在运行
 	if workflow.Status == types.WorkflowStatusRunning {
-		w.Unlock()
 		return fmt.Errorf("工作流 %s 正在运行中", name)
 	}
+
+	// 确保设置了 UserID
+	workflow.UserID = userID
 
 	// 创建新的上下文用于任务取消
 	taskCtx, cancel := context.WithCancel(context.Background())
@@ -234,8 +307,7 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 	
 	// 更新数据库中的状态
 	var dbWorkflow models.Workflow
-	if err := db.DB.Where("name = ?", name).First(&dbWorkflow).Error; err != nil {
-		w.Unlock()
+	if err := db.DB.Where("name = ? AND user_id = ?", name, userID).First(&dbWorkflow).Error; err != nil {
 		return fmt.Errorf("获取工作流失败: %v", err)
 	}
 	
@@ -245,13 +317,11 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 	dbWorkflow.LastRun = string(lastRun)
 	
 	if err := db.DB.Save(&dbWorkflow).Error; err != nil {
-		w.Unlock()
 		return fmt.Errorf("保存工作流状态失败: %v", err)
 	}
 
 	w.addWorkflowLog(workflow, "info", fmt.Sprintf("开始执行工作流，包含 %d 个镜像，目标仓库数量: %d", 
 		len(workflow.Images), len(workflow.Targets)))
-	w.Unlock()
 
 	// 在后台执行同步任务
 	go func() {
@@ -262,9 +332,9 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 		}()
 
 		syncer := registry.NewImageSyncer(workflow.Source, workflow.Targets)
+		var syncErrors []string
 		
 		for _, image := range workflow.Images {
-			// 检查任务是否被取消
 			select {
 			case <-taskCtx.Done():
 				w.Lock()
@@ -276,7 +346,7 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 				
 				// 更新数据库
 				var dbWorkflow models.Workflow
-				if err := db.DB.Where("name = ?", workflow.Name).First(&dbWorkflow).Error; err == nil {
+				if err := db.DB.Where("name = ? AND user_id = ?", workflow.Name, workflow.UserID).First(&dbWorkflow).Error; err == nil {
 					lastRun, _ := json.Marshal(run)
 					dbWorkflow.Status = string(workflow.Status)
 					dbWorkflow.LastRun = string(lastRun)
@@ -291,22 +361,10 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 
 				if err := syncer.SyncImage(taskCtx, image); err != nil {
 					w.Lock()
-					run.EndTime = time.Now()
-					run.Status = types.WorkflowStatusFailed
-					run.Message = fmt.Sprintf("同步镜像 %s 失败: %v", image, err)
-					workflow.Status = types.WorkflowStatusFailed
-					w.addWorkflowLog(workflow, "error", run.Message)
-					
-					// 更新数据库
-					var dbWorkflow models.Workflow
-					if err := db.DB.Where("name = ?", workflow.Name).First(&dbWorkflow).Error; err == nil {
-						lastRun, _ := json.Marshal(run)
-						dbWorkflow.Status = string(workflow.Status)
-						dbWorkflow.LastRun = string(lastRun)
-						db.DB.Save(&dbWorkflow)
-					}
+					syncErrors = append(syncErrors, fmt.Sprintf("同步镜像 %s 失败: %v", image, err))
+					w.addWorkflowLog(workflow, "error", fmt.Sprintf("同步镜像 %s 失败: %v", image, err))
 					w.Unlock()
-					return
+					continue
 				}
 
 				w.Lock()
@@ -317,14 +375,19 @@ func (w *workflowServiceImpl) ExecuteWorkflow(ctx context.Context, name string) 
 
 		w.Lock()
 		run.EndTime = time.Now()
-		run.Status = types.WorkflowStatusSuccess
-		run.Message = fmt.Sprintf("成功同步 %d 个镜像到 %d 个目标仓库", len(workflow.Images), len(workflow.Targets))
-		workflow.Status = types.WorkflowStatusSuccess
+		if len(syncErrors) > 0 {
+			run.Status = types.WorkflowStatusFailed
+			run.Message = fmt.Sprintf("部分镜像同步失败：\n%s", strings.Join(syncErrors, "\n"))
+		} else {
+			run.Status = types.WorkflowStatusSuccess
+			run.Message = fmt.Sprintf("成功同步 %d 个镜像到 %d 个目标仓库", len(workflow.Images), len(workflow.Targets))
+		}
+		workflow.Status = run.Status
 		w.addWorkflowLog(workflow, "info", run.Message)
 		
 		// 更新数据库
 		var dbWorkflow models.Workflow
-		if err := db.DB.Where("name = ?", workflow.Name).First(&dbWorkflow).Error; err == nil {
+		if err := db.DB.Where("name = ? AND user_id = ?", workflow.Name, workflow.UserID).First(&dbWorkflow).Error; err == nil {
 			lastRun, _ := json.Marshal(run)
 			dbWorkflow.Status = string(workflow.Status)
 			dbWorkflow.LastRun = string(lastRun)
@@ -352,16 +415,16 @@ func (w *workflowServiceImpl) CancelWorkflow(ctx context.Context, name string) e
 
 // addWorkflowLog 添加工作流日志
 func (w *workflowServiceImpl) addWorkflowLog(workflow *types.WorkflowSpec, level, message string) {
+	userID := workflow.UserID
 	log := types.WorkflowLog{
 		Timestamp: time.Now(),
 		Level:     level,
 		Message:   message,
 	}
-	workflow.Logs = append(workflow.Logs, log)
 
 	// 保存到数据库
 	var dbWorkflow models.Workflow
-	if err := db.DB.Where("name = ?", workflow.Name).First(&dbWorkflow).Error; err != nil {
+	if err := db.DB.Where("name = ? AND user_id = ?", workflow.Name, userID).First(&dbWorkflow).Error; err != nil {
 		// 如果记录不存在，可能是正在创建过程中
 		fmt.Printf("工作流 %s 的日志将在创建完成后保存\n", workflow.Name)
 		return
@@ -370,21 +433,96 @@ func (w *workflowServiceImpl) addWorkflowLog(workflow *types.WorkflowSpec, level
 	// 获取现有日志
 	var existingLogs []types.WorkflowLog
 	if dbWorkflow.Logs != "" {
-		if err := json.Unmarshal([]byte(dbWorkflow.Logs), &existingLogs); err == nil {
-			workflow.Logs = append(existingLogs, log)
+		if err := json.Unmarshal([]byte(dbWorkflow.Logs), &existingLogs); err != nil {
+			fmt.Printf("解析现有日志失败: %v，将创建新的日志列表\n", err)
+			existingLogs = make([]types.WorkflowLog, 0)
 		}
+	} else {
+		existingLogs = make([]types.WorkflowLog, 0)
 	}
 
+	// 添加新日志
+	existingLogs = append(existingLogs, log)
+	workflow.Logs = existingLogs
+
 	// 序列化日志
-	logs, err := json.Marshal(workflow.Logs)
+	logsJSON, err := json.Marshal(existingLogs)
 	if err != nil {
 		fmt.Printf("序列化日志失败: %v\n", err)
 		return
 	}
 
-	// 更新数据库
-	if err := db.DB.Model(&dbWorkflow).Update("logs", string(logs)).Error; err != nil {
+	// 使用事务更新数据库
+	if err := db.DB.Transaction(func(tx *gorm.DB) error {
+		// 重新获取最新数据
+		if err := tx.Where("name = ? AND user_id = ?", workflow.Name, userID).First(&dbWorkflow).Error; err != nil {
+			return err
+		}
+		
+		// 更新日志字段
+		if err := tx.Model(&dbWorkflow).Update("logs", string(logsJSON)).Error; err != nil {
+			return err
+		}
+		
+		return nil
+	}); err != nil {
 		fmt.Printf("保存日志失败: %v\n", err)
 		return
+	}
+}
+
+// recoverWorkflowStates 恢复异常终止的工作流状态
+func (w *workflowServiceImpl) recoverWorkflowStates() {
+	// 查找所有处于 running 状态的工作流
+	var workflows []models.Workflow
+	if err := db.DB.Where("status = ?", string(types.WorkflowStatusRunning)).Find(&workflows).Error; err != nil {
+		fmt.Printf("查询运行中的工作流失败: %v\n", err)
+		return
+	}
+
+	for _, workflow := range workflows {
+		// 将状态更新为失败
+		run := &types.WorkflowRun{
+			StartTime: workflow.UpdatedAt,
+			EndTime:   time.Now(),
+			Status:    types.WorkflowStatusFailed,
+			Message:   "工作流异常终止，系统重启后自动恢复状态",
+		}
+
+		lastRun, _ := json.Marshal(run)
+		
+		// 使用事务更新状态和添加日志
+		if err := db.DB.Transaction(func(tx *gorm.DB) error {
+			// 更新状态和最后运行记录
+			if err := tx.Model(&workflow).Updates(map[string]interface{}{
+				"status":   string(types.WorkflowStatusFailed),
+				"last_run": string(lastRun),
+			}).Error; err != nil {
+				return err
+			}
+
+			// 添加日志
+			var logs []types.WorkflowLog
+			if workflow.Logs != "" {
+				if err := json.Unmarshal([]byte(workflow.Logs), &logs); err == nil {
+					logs = append(logs, types.WorkflowLog{
+						Timestamp: time.Now(),
+						Level:     "error",
+						Message:   "工作流异常终止，系统重启后自动恢复状态",
+					})
+					if logsJSON, err := json.Marshal(logs); err == nil {
+						if err := tx.Model(&workflow).Update("logs", string(logsJSON)).Error; err != nil {
+							return err
+						}
+					}
+				}
+			}
+
+			return nil
+		}); err != nil {
+			fmt.Printf("恢复工作流 %s 状态失败: %v\n", workflow.Name, err)
+		} else {
+			fmt.Printf("已恢复工作流 %s 的状态\n", workflow.Name)
+		}
 	}
 } 
